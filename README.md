@@ -4,7 +4,7 @@
 
 ## 🛠 Requirements
 
-- macOS 15 or newer (Apple Foundation Models require it)
+- macOS 26 or newer (Apple Foundation Models require it)
 - Xcode Command Line Tools (`xcode-select --install`)
 - Git installed and available on your PATH
 
