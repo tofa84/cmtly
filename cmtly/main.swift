@@ -802,7 +802,13 @@ private final class Spinner {
 }
 
 private enum Version {
+    static let declared = "0.1.0"
+
     static let current: String = {
+        if declared.containsNonWhitespace {
+            return declared
+        }
+
         if let infoVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
            infoVersion.containsNonWhitespace {
             return infoVersion
