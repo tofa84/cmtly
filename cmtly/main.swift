@@ -12,10 +12,12 @@ import Dispatch
 private struct CLIOptions {
     let verbose: Bool
     let displayHelp: Bool
+    let displayVersion: Bool
 
     static func parse(arguments: [String]) throws -> CLIOptions {
         var verbose = false
         var displayHelp = false
+        var displayVersion = false
 
         for argument in arguments {
             switch argument {
@@ -23,12 +25,14 @@ private struct CLIOptions {
                 verbose = true
             case "-h", "--help":
                 displayHelp = true
+            case "-V", "--version":
+                displayVersion = true
             default:
                 throw CLIError.invalidOption(argument)
             }
         }
 
-        return CLIOptions(verbose: verbose, displayHelp: displayHelp)
+        return CLIOptions(verbose: verbose, displayHelp: displayHelp, displayVersion: displayVersion)
     }
 }
 
@@ -51,6 +55,11 @@ private func runCmtly() async -> Int32 {
 
         if options.displayHelp {
             Diagnostics.printUsage()
+            return EXIT_SUCCESS
+        }
+
+        if options.displayVersion {
+            Diagnostics.printVersion()
             return EXIT_SUCCESS
         }
 
@@ -243,7 +252,8 @@ private struct CommitMessageGenerator {
     private func collectChunkedMessages(for segment: DiffSplitter.Segment, using model: FoundationModels.SystemLanguageModel) async throws -> [String] {
         let chunks = DiffSplitter.chunk(segment: segment)
         guard chunks.count > 1 else {
-            return []
+            Logger.debug("Chunking did not split diff for '\(segment.path)'; using truncated diff.")
+            return try await collectTruncatedMessage(for: segment, using: model)
         }
         Logger.debug("Split segment '\(segment.path)' into \(chunks.count) chunks.")
 
@@ -277,6 +287,31 @@ private struct CommitMessageGenerator {
         }
 
         return responses
+    }
+
+    private func collectTruncatedMessage(for segment: DiffSplitter.Segment, using model: FoundationModels.SystemLanguageModel) async throws -> [String] {
+        let truncated = DiffTrimmer.truncate(segment.diff, maxLines: 120, tailLines: 40)
+        do {
+            let raw = try await respond(
+                model: model,
+                instructions: CommitMessagePrompt.instructions,
+                prompt: CommitMessagePrompt(
+                    diff: truncated,
+                    filePath: segment.path,
+                    contextHint: "Diff truncated to fit context window"
+                ).render()
+            )
+            let message = sanitize(raw)
+            return message.containsNonWhitespace ? [message] : []
+        } catch let error as FoundationModels.LanguageModelSession.GenerationError {
+            if case .exceededContextWindowSize = error {
+                let fileName = (segment.path as NSString).lastPathComponent
+                return ["chore: update \(fileName)"]
+            }
+            throw CLIError.foundationModelFailed(error.localizedDescription)
+        } catch {
+            throw CLIError.foundationModelFailed(String(describing: error))
+        }
     }
 
     private func respond(model: FoundationModels.SystemLanguageModel, instructions: String, prompt: String) async throws -> String {
@@ -547,6 +582,25 @@ private enum DiffSplitter {
     }
 }
 
+private enum DiffTrimmer {
+    static func truncate(_ diff: String, maxLines: Int, tailLines: Int) -> String {
+        let lines = diff
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        guard lines.count > maxLines else {
+            return diff
+        }
+
+        let safeTail = min(tailLines, maxLines / 3)
+        let headCount = max(0, maxLines - safeTail - 1)
+        let head = lines.prefix(headCount)
+        let tail = lines.suffix(safeTail)
+
+        return (head + ["[diff truncated]"] + tail).joined(separator: "\n")
+    }
+}
+
 private struct ProcessExecutor {
     enum Error: Swift.Error {
         case launchFailed
@@ -680,12 +734,17 @@ private enum Diagnostics {
         FileHandle.standardError.write(Data((message + "\n").utf8))
     }
 
+    static func printVersion() {
+        FileHandle.standardOutput.write(Data(("cmtly \(Version.current)\n").utf8))
+    }
+
     static func printUsage() {
         let usage = """
         Usage: cmtly [options]
 
           -v, --verbose    Enable verbose logging
           -h, --help       Show this help information
+          -V, --version    Show version information
         """
         FileHandle.standardOutput.write(Data((usage + "\n").utf8))
     }
@@ -740,6 +799,27 @@ private final class Spinner {
         let clearLine = "\r\u{001B}[K"
         FileHandle.standardError.write(Data(clearLine.utf8))
     }
+}
+
+private enum Version {
+    static let current: String = {
+        if let infoVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+           infoVersion.containsNonWhitespace {
+            return infoVersion
+        }
+
+        if let buildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+           buildVersion.containsNonWhitespace {
+            return buildVersion
+        }
+
+        if let envVersion = ProcessInfo.processInfo.environment["CMTLY_VERSION"],
+           envVersion.containsNonWhitespace {
+            return envVersion
+        }
+
+        return "dev"
+    }()
 }
 
 private enum Logger {
