@@ -44,6 +44,21 @@ which cmtly
 - No staged changes are detected
 - The Apple Foundation Model service is unavailable
 
+## ⚙️ Configuration
+
+`cmtly` reads configuration from `~/.cmtly/config.json`. If the file does not exist, it will be created with defaults on first run.
+
+Example:
+
+```json
+{
+  "ignoredExtensions": ["png", "jpg", "md"],
+  "ignoredSuffixes": [""]
+}
+```
+
+Extensions are case-insensitive and may include a leading dot. Suffixes match the end of the file name and are case-insensitive.
+
 ## 🆘 Troubleshooting
 
 - **`cmtly` not found:** Ensure `~/.cmtly/bin` appears in `echo $PATH` and that you restarted your shell.

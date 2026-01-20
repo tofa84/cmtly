@@ -77,8 +77,28 @@ private func runCmtly() async -> Int32 {
         guard let diff = try git.stagedDiff(), diff.containsNonWhitespace else {
             throw CLIError.noStagedChanges
         }
-        let diffLineCount = diff.components(separatedBy: .newlines).count
-        Logger.debug("Captured staged diff (\(diff.count) chars, \(diffLineCount) lines).")
+        let config = CmtlyConfigLoader.load()
+        let ignoredExtensions = config.normalizedIgnoredExtensions
+        let ignoredSuffixes = config.normalizedIgnoredSuffixes
+        if !ignoredExtensions.isEmpty {
+            let list = ignoredExtensions.sorted().joined(separator: ", ")
+            Logger.debug("Ignoring file extensions: \(list).")
+        }
+        if !ignoredSuffixes.isEmpty {
+            let list = ignoredSuffixes.joined(separator: ", ")
+            Logger.debug("Ignoring filename suffixes: \(list).")
+        }
+
+        let filteredDiff = DiffFilter.filter(
+            diff: diff,
+            ignoringExtensions: ignoredExtensions,
+            ignoringSuffixes: ignoredSuffixes
+        )
+        if (!ignoredExtensions.isEmpty || !ignoredSuffixes.isEmpty), !filteredDiff.containsNonWhitespace {
+            throw CLIError.onlyIgnoredChanges
+        }
+        let diffLineCount = filteredDiff.components(separatedBy: .newlines).count
+        Logger.debug("Captured staged diff (\(filteredDiff.count) chars, \(diffLineCount) lines).")
 
         let generator = CommitMessageGenerator()
         let spinner = Spinner(message: "Generating commit message…")
@@ -87,7 +107,7 @@ private func runCmtly() async -> Int32 {
         }
         defer { spinner.stop() }
 
-        let message = try await generator.generateCommitMessage(for: diff)
+        let message = try await generator.generateCommitMessage(for: filteredDiff)
         spinner.stop()
 
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -320,8 +340,8 @@ private struct CommitMessageGenerator {
             instructions: instructions
         )
         let seed = UInt64(Calendar.current.component(.dayOfYear, from: .now))
-        let sampling = GenerationOptions.SamplingMode.random(top: 10, seed: seed)
-        let options = GenerationOptions(sampling: sampling, temperature: 0.7)
+        let sampling = GenerationOptions.SamplingMode.random(top: 5, seed: seed)
+        let options = GenerationOptions(sampling: sampling, temperature: 0.5)
         let response = try await session.respond(to: prompt, options: options)
         return response.content
     }
@@ -601,6 +621,131 @@ private enum DiffTrimmer {
     }
 }
 
+private enum DiffFilter {
+    static func filter(
+        diff: String,
+        ignoringExtensions: Set<String>,
+        ignoringSuffixes: [String]
+    ) -> String {
+        guard !ignoringExtensions.isEmpty || !ignoringSuffixes.isEmpty else { return diff }
+
+        let segments = DiffSplitter.split(diff: diff)
+        var keptSegments: [DiffSplitter.Segment] = []
+
+        for segment in segments {
+            if shouldIgnore(path: segment.path, ignoringExtensions: ignoringExtensions, ignoringSuffixes: ignoringSuffixes) {
+                continue
+            }
+            keptSegments.append(segment)
+        }
+
+        return keptSegments.map(\.diff).joined(separator: "\n")
+    }
+
+    private static func shouldIgnore(
+        path: String,
+        ignoringExtensions: Set<String>,
+        ignoringSuffixes: [String]
+    ) -> Bool {
+        let lastComponent = (path as NSString).lastPathComponent
+        let lowercasedName = lastComponent.lowercased()
+
+        if let matchingSuffix = ignoringSuffixes.first(where: { lowercasedName.hasSuffix($0) }) {
+            Logger.debug("Ignoring diff for '\(path)' (suffix \(matchingSuffix)).")
+            return true
+        }
+
+        if let ext = fileExtension(for: lastComponent) {
+            let normalized = ext.lowercased()
+            if ignoringExtensions.contains(normalized) {
+                Logger.debug("Ignoring diff for '\(path)' (.\(normalized)).")
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func fileExtension(for fileName: String) -> String? {
+        guard !fileName.isEmpty, let dotIndex = fileName.lastIndex(of: ".") else {
+            return nil
+        }
+        let extStart = fileName.index(after: dotIndex)
+        let ext = String(fileName[extStart...])
+        return ext.isEmpty ? nil : ext
+    }
+}
+
+private struct CmtlyConfig: Codable {
+    let ignoredExtensions: [String]?
+    let ignoredSuffixes: [String]?
+
+    static let defaultConfig = CmtlyConfig(ignoredExtensions: [], ignoredSuffixes: [])
+
+    var normalizedIgnoredExtensions: Set<String> {
+        let entries = ignoredExtensions ?? []
+        return Set(entries.compactMap { raw in
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let withoutDot = trimmed.hasPrefix(".") ? String(trimmed.dropFirst()) : trimmed
+            guard !withoutDot.isEmpty else { return nil }
+            return withoutDot.lowercased()
+        })
+    }
+
+    var normalizedIgnoredSuffixes: [String] {
+        let entries = ignoredSuffixes ?? []
+        let normalized = entries.compactMap { raw in
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed.lowercased()
+        }
+        let unique = Set(normalized)
+        return unique.sorted { $0.count > $1.count }
+    }
+}
+
+private enum CmtlyConfigLoader {
+    private static let directoryName = ".cmtly"
+    private static let fileName = "config.json"
+
+    static func load() -> CmtlyConfig {
+        let url = configURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            createDefaultConfig(at: url)
+            return .defaultConfig
+        }
+
+        do {
+            let data = try Data(contentsOf: url)
+            return try JSONDecoder().decode(CmtlyConfig.self, from: data)
+        } catch {
+            Logger.debug("Failed to load config at \(url.path): \(error)")
+            return .defaultConfig
+        }
+    }
+
+    private static var configURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(directoryName)
+            .appendingPathComponent(fileName)
+    }
+
+    private static func createDefaultConfig(at url: URL) {
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted]
+            let data = try encoder.encode(CmtlyConfig.defaultConfig)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            Logger.debug("Failed to write default config to \(url.path): \(error)")
+        }
+    }
+}
+
 private struct ProcessExecutor {
     enum Error: Swift.Error {
         case launchFailed
@@ -672,6 +817,7 @@ private enum CLIError: Error {
     case gitMissing
     case notAGitRepository
     case noStagedChanges
+    case onlyIgnoredChanges
     case gitFatal(String)
     case gitCommandFailed(status: Int32, stderr: String)
     case unsupportedOperatingSystem
@@ -682,6 +828,8 @@ private enum CLIError: Error {
     var exitCode: Int32 {
         switch self {
         case .noStagedChanges:
+            return EXIT_FAILURE
+        case .onlyIgnoredChanges:
             return EXIT_FAILURE
         case .unsupportedOperatingSystem:
             return EXIT_FAILURE
@@ -712,6 +860,8 @@ extension CLIError: LocalizedError {
             return "This directory is not a Git repository. Run cmtly inside a repository with staged changes."
         case .noStagedChanges:
             return "No staged changes detected. Stage files with `git add` before running cmtly."
+        case .onlyIgnoredChanges:
+            return "All staged changes are ignored by ~/.cmtly/config.json."
         case .gitFatal(let message):
             return "Git reported an error: \(message)"
         case .gitCommandFailed(let status, let stderr):
@@ -802,7 +952,7 @@ private final class Spinner {
 }
 
 private enum Version {
-    static let declared = "0.1.0"
+    static let declared = "0.1.1"
 
     static let current: String = {
         if declared.containsNonWhitespace {
